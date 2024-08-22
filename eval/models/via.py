@@ -244,9 +244,10 @@ class ParallelVIA(nn.Module):
 
     def generate(self, audio_batch, prompts, **kwargs):
         with torch.no_grad():
-            outs, decoded_outputs, log_probs = self.via.module.generate(audio_batch, prompts, **kwargs)
+            outs, decoded_outputs, logprobs = self.via.module.generate(audio_batch, prompts, **kwargs)
             # Move results to CPU
             outs = [torch.tensor(out, device='cpu') for out in outs]
-            log_probs = [torch.tensor(prob, device='cpu') for prob in log_probs]
+            if logprobs is not None:
+                logprobs = [torch.tensor(prob, device='cpu') for prob in logprobs]
         torch.cuda.empty_cache()
-        return outs, decoded_outputs, log_probs
+        return outs, decoded_outputs, logprobs
