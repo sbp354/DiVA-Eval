@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from datasets import Audio
 from safetensors.torch import load, load_model
 from torch import nn
+import torch.nn.functional as F
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
@@ -125,6 +126,7 @@ class VIA(nn.Module):
 
             if prompts != None and prompts != "":
                 prefix_embeds = []
+                max_length = 0
                 for prompt in prompts:
                     if prompt:
                         user_prompt_text = torch.tensor(
@@ -134,8 +136,11 @@ class VIA(nn.Module):
                         prefix = torch.cat([self.pre_user_suffix, user_prompt_text, self.prefix], axis=0)
                     else:
                         prefix = self.prefix
-                    prefix_embeds.append(self.llama_decoder.model.embed_tokens(prefix))
-                prefix_embeds = torch.stack(prefix_embeds)
+                    embedded_prefix = self.llama_decoder.model.embed_tokens(prefix)
+                    prefix_embeds.append(embedded_prefix)
+                    max_length = max(max_length, embedded_prefix.shape[0])
+                padded_embeds = [F.pad(embed, (0, 0, 0, max_length - embed.shape[0])) for embed in prefix_embeds]
+                prefix_embeds = torch.stack(padded_embeds, dim = 0)
             else:
                 prefix_embeds = self.llama_decoder.model.embed_tokens(self.prefix).unsqueeze(0).repeat(batch_size, 1, 1)
             suffix_embeds = self.llama_decoder.model.embed_tokens(self.final_header).unsqueeze(0).repeat(batch_size, 1, 1)
@@ -171,7 +176,8 @@ class VIA(nn.Module):
         self,
         audio_batch: np.ndarray,
         prompts: list[str],
-        return_log_probs: bool = False,
+        return_logprobs: bool = False,
+        top_k_logprobs: int = 40,
         temperature: float = 0.001,
         do_sample: bool = False,
         max_new_tokens: int = 128,
@@ -203,16 +209,20 @@ class VIA(nn.Module):
                 else:
                     next_tokens = next_token_logits.argmax(dim=-1)
 
-        
-                if return_log_probs:
-                    token_log_probs = torch.log(probs)
+                if return_logprobs:
+                    token_logprobs = torch.log(probs)
+                    if top_k_logprobs:
+                        token_logprobs, _ = torch.topk(token_logprobs, k=top_k_logprobs, dim=-1)
 
                 for i in range(batch_size):
                     if not_finished[i]:
                         token = next_tokens[i].item()
                         outs[i].append(token)
-                        if return_log_probs:
-                            log_probs[i].append(token_log_probs[i, token].item())
+                        if return_logprobs:
+                            if top_k_logprobs:
+                                logprobs[i].append(token_logprobs[i].tolist())
+                            else:
+                                logprobs[i].append(token_logprobs[i, token].item())
                         if next_tokens[i] == 128009:  # EOT token
                             not_finished[i] = False
 
@@ -225,7 +235,7 @@ class VIA(nn.Module):
                 decoded = self.tokenizer.decode(out, skip_special_tokens=True).replace("<|eot_id|>", "")
                 decoded_outputs.append(decoded)
 
-        return outs, decoded_outputs, log_probs
+        return outs, decoded_outputs, logprobs if return_logprobs else None
 
 class ParallelVIA(nn.Module):
     def __init__(self, via_path):
