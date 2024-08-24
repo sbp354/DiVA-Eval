@@ -89,11 +89,17 @@ class VIA(nn.Module):
         self.processor = AutoProcessor.from_pretrained("openai/whisper-large-v3")
         self.tokenizer = AutoTokenizer.from_pretrained("WillHeld/via-llama")
         self.prefix = torch.tensor([128000, 128006, 882, 128007, 271]).to(self.device)
-        self.pre_user_suffix = torch.tensor(
+        self.pre_system_suffix = torch.tensor(
             self.tokenizer.encode(
                 "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
             )
         ).to(self.device)
+        self.pre_user_suffix = torch.tensor(
+            self.tokenizer.encode(
+                "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n"
+            )
+        ).to(self.device)
+        
         self.final_header = torch.tensor([128009, 128006, 78191, 128007, 271]).to(
             self.device
         )
@@ -111,7 +117,7 @@ class VIA(nn.Module):
             return input_features[..., :target_length].to(input_device)
         return input_features.to(input_device)
 
-    def prepare_batch_inputs(self, audio, prompts, batch_size, padding=True):
+    def prepare_batch_inputs(self, audio, prompts, system_prompts =None, padding=True):
         with torch.no_grad():
             inputs = self.processor(audio, return_tensors="pt", sampling_rate=16_000, padding=True)
             input_features = inputs.input_features.to(self.device)
@@ -124,16 +130,28 @@ class VIA(nn.Module):
 
             batch_size = virt_tokens.shape[0]
 
+            if system_prompts:
+                system_prompt_embeds = []
+                for system_prompt in system_prompts:
+                    system_prompt_ids = self.tokenizer.encode(system_prompt, add_special_tokens=False)
+                    system_prompt_tensor = torch.tensor(system_prompt_ids, device=self.device)
+            
+
+
             if prompts != None and prompts != "":
                 prefix_embeds = []
                 max_length = 0
-                for prompt in prompts:
+                for i, prompt in enumerate(prompts):
                     if prompt:
-                        user_prompt_text = torch.tensor(
+                        user_prompt_tensor = torch.tensor(
                             self.tokenizer(prompt, add_special_tokens=False)["input_ids"],
                             device=self.pre_user_suffix.device,
                         )
-                        prefix = torch.cat([self.pre_user_suffix, user_prompt_text, self.prefix], axis=0)
+                        if system_prompts:
+                            prefix = torch.cat([self.pre_system_suffix, system_prompt_tensor[i], self.pre_user_suffix, user_prompt_tensor, self.prefix], axis=0)
+                        else:
+                            #With llama3 prompt formatting, we use a system suffix if there is only one prompt input, not user
+                            prefix = torch.cat([self.pre_system_suffix, user_prompt_tensor, self.prefix], axis=0)
                     else:
                         prefix = self.prefix
                     embedded_prefix = self.llama_decoder.model.embed_tokens(prefix)
@@ -142,7 +160,8 @@ class VIA(nn.Module):
                 padded_embeds = [F.pad(embed, (0, 0, 0, max_length - embed.shape[0])) for embed in prefix_embeds]
                 prefix_embeds = torch.stack(padded_embeds, dim = 0)
             else:
-                prefix_embeds = self.llama_decoder.model.embed_tokens(self.prefix).unsqueeze(0).repeat(batch_size, 1, 1)
+                prefix_embeds = self.llama_decoder.model.embed_tokens(self.prefix)
+                prefix_embeds = prefix_embeds.unsqueeze(0).repeat(batch_size, 1, 1)
             suffix_embeds = self.llama_decoder.model.embed_tokens(self.final_header).unsqueeze(0).repeat(batch_size, 1, 1)
             input_embeds = torch.cat([prefix_embeds, virt_tokens, suffix_embeds], dim=1)
 
@@ -152,10 +171,11 @@ class VIA(nn.Module):
         self,
         audio_batch: np.ndarray,
         prompts: list[str],
+        system_prompts: list[str],
         **kwargs
 
     ):
-        input_embeds = self.prepare_batch_inputs(audio_batch, prompts, kwargs.get("padding", True))
+        input_embeds = self.prepare_batch_inputs(audio_batch, prompts, system_prompts, kwargs.get("padding", True))
         # Use VLLM for text generation
         sampling_params = SamplingParams(
             temperature=kwargs.get('temperature', 0.7),
@@ -176,6 +196,7 @@ class VIA(nn.Module):
         self,
         audio_batch: np.ndarray,
         prompts: list[str],
+        system_prompts: list[str],
         return_logprobs: bool = False,
         top_k_logprobs: int = 40,
         temperature: float = 0.001,
@@ -184,7 +205,7 @@ class VIA(nn.Module):
         padding: bool = True,
     ):  
         with torch.no_grad():
-            input_embeds = self.prepare_batch_inputs(audio_batch, prompts, padding)
+            input_embeds = self.prepare_batch_inputs(audio_batch, prompts, system_prompts, padding)
 
             batch_size = input_embeds.shape[0]
             outs = [[] for _ in range(batch_size)]
@@ -244,9 +265,10 @@ class ParallelVIA(nn.Module):
 
     def generate(self, audio_batch, prompts, **kwargs):
         with torch.no_grad():
-            outs, decoded_outputs, log_probs = self.via.module.generate(audio_batch, prompts, **kwargs)
+            outs, decoded_outputs, logprobs = self.via.module.generate(audio_batch, prompts, **kwargs)
             # Move results to CPU
             outs = [torch.tensor(out, device='cpu') for out in outs]
-            log_probs = [torch.tensor(prob, device='cpu') for prob in log_probs]
+            if logprobs is not None:
+                logprobs = [torch.tensor(prob, device='cpu') for prob in logprobs]
         torch.cuda.empty_cache()
-        return outs, decoded_outputs, log_probs
+        return outs, decoded_outputs, logprobs
